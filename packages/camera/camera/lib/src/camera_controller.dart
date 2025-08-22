@@ -58,21 +58,21 @@ class CameraValue {
 
   /// Creates a new camera controller state for an uninitialized controller.
   const CameraValue.uninitialized(CameraDescription description)
-    : this(
-        isInitialized: false,
-        isRecordingVideo: false,
-        isTakingPicture: false,
-        isStreamingImages: false,
-        isRecordingPaused: false,
-        flashMode: FlashMode.auto,
-        exposureMode: ExposureMode.auto,
-        exposurePointSupported: false,
-        focusMode: FocusMode.auto,
-        focusPointSupported: false,
-        deviceOrientation: DeviceOrientation.portraitUp,
-        isPreviewPaused: false,
-        description: description,
-      );
+      : this(
+          isInitialized: false,
+          isRecordingVideo: false,
+          isTakingPicture: false,
+          isStreamingImages: false,
+          isRecordingPaused: false,
+          flashMode: FlashMode.auto,
+          exposureMode: ExposureMode.auto,
+          exposurePointSupported: false,
+          focusMode: FocusMode.auto,
+          focusPointSupported: false,
+          deviceOrientation: DeviceOrientation.portraitUp,
+          isPreviewPaused: false,
+          description: description,
+        );
 
   /// True after [CameraController.initialize] has completed successfully.
   final bool isInitialized;
@@ -187,20 +187,17 @@ class CameraValue {
           exposurePointSupported ?? this.exposurePointSupported,
       focusPointSupported: focusPointSupported ?? this.focusPointSupported,
       deviceOrientation: deviceOrientation ?? this.deviceOrientation,
-      lockedCaptureOrientation:
-          lockedCaptureOrientation == null
-              ? this.lockedCaptureOrientation
-              : lockedCaptureOrientation.orNull,
-      recordingOrientation:
-          recordingOrientation == null
-              ? this.recordingOrientation
-              : recordingOrientation.orNull,
+      lockedCaptureOrientation: lockedCaptureOrientation == null
+          ? this.lockedCaptureOrientation
+          : lockedCaptureOrientation.orNull,
+      recordingOrientation: recordingOrientation == null
+          ? this.recordingOrientation
+          : recordingOrientation.orNull,
       isPreviewPaused: isPreviewPaused ?? this.isPreviewPaused,
       description: description ?? this.description,
-      previewPauseOrientation:
-          previewPauseOrientation == null
-              ? this.previewPauseOrientation
-              : previewPauseOrientation.orNull,
+      previewPauseOrientation: previewPauseOrientation == null
+          ? this.previewPauseOrientation
+          : previewPauseOrientation.orNull,
     );
   }
 
@@ -252,14 +249,14 @@ class CameraController extends ValueNotifier<CameraValue> {
     int? videoBitrate,
     int? audioBitrate,
     this.imageFormatGroup,
-  }) : mediaSettings = MediaSettings(
-         resolutionPreset: resolutionPreset,
-         enableAudio: enableAudio,
-         fps: fps,
-         videoBitrate: videoBitrate,
-         audioBitrate: audioBitrate,
-       ),
-       super(CameraValue.uninitialized(description));
+  })  : mediaSettings = MediaSettings(
+          resolutionPreset: resolutionPreset,
+          enableAudio: enableAudio,
+          fps: fps,
+          videoBitrate: videoBitrate,
+          audioBitrate: audioBitrate,
+        ),
+        super(CameraValue.uninitialized(description));
 
   /// The properties of the camera device controlled by this controller.
   CameraDescription get description => value.description;
@@ -296,13 +293,16 @@ class CameraController extends ValueNotifier<CameraValue> {
 
   bool _isDisposed = false;
   StreamSubscription<CameraImageData>? _imageStreamSubscription;
+  Timer? _imageStreamThrottleTimer;
+  CameraImage? _latestCameraImage;
+  onLatestImageAvailable? _throttledCallback;
 
   // A Future awaiting an attempt to initialize (e.g. after `initialize` was
   // just called). If the controller has not been initialized at least once,
   // this value is null.
   Future<void>? _initializeFuture;
   StreamSubscription<DeviceOrientationChangedEvent>?
-  _deviceOrientationSubscription;
+      _deviceOrientationSubscription;
 
   /// Checks whether [CameraController.dispose] has completed successfully.
   ///
@@ -340,8 +340,8 @@ class CameraController extends ValueNotifier<CameraValue> {
       _deviceOrientationSubscription ??= CameraPlatform.instance
           .onDeviceOrientationChanged()
           .listen((DeviceOrientationChangedEvent event) {
-            value = value.copyWith(deviceOrientation: event.orientation);
-          });
+        value = value.copyWith(deviceOrientation: event.orientation);
+      });
 
       _cameraId = await CameraPlatform.instance.createCameraWithSettings(
         description,
@@ -486,6 +486,12 @@ class CameraController extends ValueNotifier<CameraValue> {
   /// have significant frame rate drops for [CameraPreview] on lower end
   /// devices.
   ///
+  /// The [callbackDelay] parameter allows you to control how often the callback
+  /// is executed. If provided, the callback will be throttled to execute at most
+  /// once per [callbackDelay] duration. The latest available frame will be used
+  /// when the callback is triggered. If not provided, the callback will be
+  /// executed for every frame (default behavior).
+  ///
   /// Throws a [CameraException] if image streaming or video recording has
   /// already started.
   ///
@@ -493,7 +499,10 @@ class CameraController extends ValueNotifier<CameraValue> {
   /// report support for image streaming via [supportsImageStreaming].
   ///
   // TODO(bmparr): Add settings for resolution and fps.
-  Future<void> startImageStream(onLatestImageAvailable onAvailable) async {
+  Future<void> startImageStream(
+    onLatestImageAvailable onAvailable, {
+    Duration? callbackDelay,
+  }) async {
     assert(supportsImageStreaming());
     _throwIfNotInitialized('startImageStream');
     if (value.isRecordingVideo) {
@@ -510,11 +519,31 @@ class CameraController extends ValueNotifier<CameraValue> {
     }
 
     try {
-      _imageStreamSubscription = CameraPlatform.instance
-          .onStreamedFrameAvailable(_cameraId)
-          .listen((CameraImageData imageData) {
-            onAvailable(CameraImage.fromPlatformInterface(imageData));
-          });
+      _throttledCallback = onAvailable;
+
+      if (callbackDelay != null) {
+        // Throttled mode: store latest frame and call callback at intervals
+        _imageStreamSubscription = CameraPlatform.instance
+            .onStreamedFrameAvailable(_cameraId)
+            .listen((CameraImageData imageData) {
+          _latestCameraImage = CameraImage.fromPlatformInterface(imageData);
+        });
+
+        // Start timer to periodically call the callback with the latest frame
+        _imageStreamThrottleTimer = Timer.periodic(callbackDelay, (_) {
+          if (_latestCameraImage != null && _throttledCallback != null) {
+            _throttledCallback!(_latestCameraImage!);
+          }
+        });
+      } else {
+        // Default mode: call callback for every frame
+        _imageStreamSubscription = CameraPlatform.instance
+            .onStreamedFrameAvailable(_cameraId)
+            .listen((CameraImageData imageData) {
+          onAvailable(CameraImage.fromPlatformInterface(imageData));
+        });
+      }
+
       value = value.copyWith(isStreamingImages: true);
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
@@ -542,6 +571,12 @@ class CameraController extends ValueNotifier<CameraValue> {
       value = value.copyWith(isStreamingImages: false);
       await _imageStreamSubscription?.cancel();
       _imageStreamSubscription = null;
+
+      // Clean up throttling resources
+      _imageStreamThrottleTimer?.cancel();
+      _imageStreamThrottleTimer = null;
+      _latestCameraImage = null;
+      _throttledCallback = null;
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }
@@ -893,6 +928,7 @@ class CameraController extends ValueNotifier<CameraValue> {
       return;
     }
     _unawaited(_deviceOrientationSubscription?.cancel());
+    _imageStreamThrottleTimer?.cancel();
     _isDisposed = true;
     super.dispose();
     if (_initializeFuture != null) {
